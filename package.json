@@ -1,0 +1,14 @@
+{
+  "name": "fanjet-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A battery-electric plane on six multi-stage ducted fans: first-order design and flight lab in the browser",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}
