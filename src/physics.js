@@ -269,4 +269,351 @@ function finish(rec, mdot, Ve, V0, rho, geo) {
   return rec;
 }
 
-export { G, D2R, isa, DEFAULT_DESIGN, RANGES, K, WING, engineGeometry, DH_WARN, solveEngine };
+// ---------------------------------------------------------------------------
+// Whole aircraft
+// ---------------------------------------------------------------------------
+function massBreakdown(d, geo) {
+  const nEng = 2 * d.enginesPerWing;
+  const motors = d.powerKW / K.motorKWperKg;
+  let fans = 0;
+  for (const s of geo.stages) {
+    fans += 14 * s.D * s.D + 0.8;                       // rotor + hub bearings
+    if (d.swirl === 'stators') fans += 7 * s.D * s.D;   // stator vanes
+  }
+  const wet = Math.PI * geo.Dmax * geo.L + Math.PI * 0.85 * geo.Df * geo.L;
+  const nacelle = 3.0 * wet + 3.5;                      // composite skins + pylon
+  const perEngine = fans + nacelle;
+  const engines = nEng * perEngine;
+  const people = d.people * K.personKg;
+  const total = K.airframeKg + motors + engines + d.batteryKg + people;
+  return { airframe: K.airframeKg, motors, engines, perEngine, battery: d.batteryKg, people, total };
+}
+
+function buildAircraft(design) {
+  const d = { ...DEFAULT_DESIGN, ...design };
+  const geo = engineGeometry(d);
+  const nEng = 2 * d.enginesPerWing;
+  const mass = massBreakdown(d, geo);
+  const wetOuter = Math.PI * geo.Dmax * geo.L;
+  const nacelleCdA = 0.0044 * wetOuter + 0.004;
+  const ac = {
+    d, geo, nEng, mass,
+    m: mass.total,
+    W: mass.total * G,
+    PengShaftMax: (d.powerKW * 1000) / nEng,
+    nacelleCdA,
+    energyJ: d.batteryKg * d.whPerKg * 3600,
+  };
+  const rho0 = isa(0).rho;
+  ac.vsClean = Math.sqrt((2 * ac.W) / (rho0 * WING.S * WING.clmax.clean));
+  ac.vsTO = Math.sqrt((2 * ac.W) / (rho0 * WING.S * WING.clmax.to));
+  ac.vsLand = Math.sqrt((2 * ac.W) / (rho0 * WING.S * WING.clmax.land));
+  ac.vr = 1.1 * ac.vsTO;
+  ac.vApp = 1.3 * ac.vsLand;
+  return ac;
+}
+
+// Spillage drag: a big intake asked to swallow only a little air spills the rest
+// around its lip.
+function spillDrag(ac, q, mfr) {
+  const Alip = (Math.PI / 4) * ac.geo.Dlip * ac.geo.Dlip;
+  const x = Math.max(0, 0.55 - mfr);
+  return q * Alip * 0.1 * (x * x) / 0.3025;
+}
+
+// Ground effect on induced drag (McCormick)
+function groundEffect(hAgl) {
+  if (hAgl === undefined || hAgl > 3 * WING.b) return 1;
+  const r = (16 * Math.max(hAgl + 1.5, 0.5)) / WING.b;
+  return (r * r) / (1 + r * r);
+}
+
+function aeroForces(ac, V, rho, CL, cfg, gearDown, eng, hAgl) {
+  const q = 0.5 * rho * V * V;
+  const cdi = (CL * CL) / (Math.PI * WING.e * WING.AR) * groundEffect(hAgl);
+  const cd0 = WING.cd0 + WING.dcdFlaps[cfg] + (gearDown ? WING.dcdGear : 0);
+  const Dair = q * WING.S * (cd0 + cdi);
+  const Dnac = q * ac.nEng * ac.nacelleCdA;
+  const Dspill = eng ? ac.nEng * spillDrag(ac, q, eng.mfr) : 0;
+  return {
+    q, L: q * WING.S * CL,
+    D: Dair + Dnac + Dspill,
+    Dparts: { wing: q * WING.S * cd0, induced: q * WING.S * cdi, nacelles: Dnac, spill: Dspill },
+  };
+}
+
+function batteryPower(ac, eng) {
+  return (ac.nEng * eng.elecW + K.hotelW) / K.etaBatt;
+}
+
+// Throttle (0..1) that gives total thrust Treq at speed V. Returns {throttle, eng}.
+function throttleFor(ac, Treq, V, rho, guessMdot) {
+  let lo = 0, hi = 1;
+  let engHi = solveEngine(ac.geo, ac.d.swirl, V, rho, ac.PengShaftMax, guessMdot);
+  if (ac.nEng * engHi.T <= Treq) return { throttle: 1, eng: engHi, saturated: true };
+  let eng = engHi;
+  for (let i = 0; i < 22; i++) {
+    const mid = 0.5 * (lo + hi);
+    eng = solveEngine(ac.geo, ac.d.swirl, V, rho, mid * ac.PengShaftMax, eng.mdot);
+    if (ac.nEng * eng.T > Treq) hi = mid; else lo = mid;
+    if (hi - lo < 0.002) break;
+  }
+  const th = 0.5 * (lo + hi);
+  eng = solveEngine(ac.geo, ac.d.swirl, V, rho, th * ac.PengShaftMax, eng.mdot);
+  return { throttle: th, eng, saturated: false };
+}
+
+// Steady, level flight at speed V and altitude h.
+function levelFlight(ac, V, h, cfg = 'clean', gearDown = false) {
+  const { rho } = isa(h);
+  const q = 0.5 * rho * V * V;
+  const CL = ac.W / (q * WING.S);
+  if (CL > WING.clmax[cfg] * 0.95) return { ok: false, reason: 'stall', CL };
+  // drag depends on spillage, which depends on the engine: iterate twice
+  let a = aeroForces(ac, V, rho, CL, cfg, gearDown, null, 1e9);
+  let r = throttleFor(ac, a.D, V, rho);
+  a = aeroForces(ac, V, rho, CL, cfg, gearDown, r.eng, 1e9);
+  r = throttleFor(ac, a.D, V, rho, r.eng.mdot);
+  const P = batteryPower(ac, r.eng);
+  return {
+    ok: !r.saturated, V, h, rho, CL, D: a.D, Dparts: a.Dparts,
+    throttle: r.throttle, eng: r.eng, Pbatt: P,
+    LoD: ac.W / a.D,
+    etaOverall: (a.D * V) / P,
+  };
+}
+
+// Fastest steady level speed at altitude h (full power)
+function maxLevelSpeed(ac, h) {
+  const { rho } = isa(h);
+  const excess = (V) => {
+    const q = 0.5 * rho * V * V;
+    const CL = ac.W / (q * WING.S);
+    const eng = solveEngine(ac.geo, ac.d.swirl, V, rho, ac.PengShaftMax);
+    const a = aeroForces(ac, V, rho, CL, 'clean', false, eng, 1e9);
+    return ac.nEng * eng.T - a.D;
+  };
+  const vmin = ac.vsClean * Math.sqrt(isa(0).rho / rho) * 1.15;
+  let lo = vmin, hi = 170;
+  if (excess(lo) <= 0) return 0;
+  if (excess(hi) > 0) return hi;
+  for (let i = 0; i < 30; i++) {
+    const mid = 0.5 * (lo + hi);
+    if (excess(mid) > 0) lo = mid; else hi = mid;
+  }
+  return 0.5 * (lo + hi);
+}
+
+// Best climb speed (max rate of climb) at altitude h, clean config
+function bestClimb(ac, h) {
+  const { rho } = isa(h);
+  const vs = ac.vsClean * Math.sqrt(isa(0).rho / rho);
+  let best = { roc: -1e9, V: 1.3 * vs };
+  for (let i = 0; i <= 8; i++) {
+    const V = vs * (1.2 + i * 0.12);
+    const q = 0.5 * rho * V * V;
+    const CL = ac.W / (q * WING.S);
+    const eng = solveEngine(ac.geo, ac.d.swirl, V, rho, ac.PengShaftMax);
+    const a = aeroForces(ac, V, rho, CL, 'clean', false, eng, 1e9);
+    const roc = ((ac.nEng * eng.T - a.D) * V) / ac.W;
+    if (roc > best.roc) best = { roc, V, eng, D: a.D };
+  }
+  return best;
+}
+
+// Speed that flies farthest per unit of battery energy at altitude h
+function bestRangeSpeed(ac, h, vmax) {
+  const { rho } = isa(h);
+  const vs = ac.vsClean * Math.sqrt(isa(0).rho / rho);
+  const top = Math.max(vs * 1.4, vmax || 120);
+  let best = { V: vs * 1.4, kmPerKwh: 0 };
+  const evalV = (V) => {
+    const lf = levelFlight(ac, V, h);
+    return lf.ok ? V / lf.Pbatt : 0; // m per J
+  };
+  for (let i = 0; i <= 12; i++) {
+    const V = vs * 1.25 + ((top - vs * 1.25) * i) / 12;
+    const e = evalV(V);
+    if (e > best.kmPerKwh) best = { V, kmPerKwh: e };
+  }
+  // golden refine
+  let a = Math.max(vs * 1.2, best.V - (top - vs) / 12), b = Math.min(top, best.V + (top - vs) / 12);
+  for (let i = 0; i < 14; i++) {
+    const m1 = a + 0.382 * (b - a), m2 = a + 0.618 * (b - a);
+    if (evalV(m1) > evalV(m2)) b = m2; else a = m1;
+  }
+  const V = 0.5 * (a + b);
+  return { V, mPerJ: evalV(V) };
+}
+
+// ---------------------------------------------------------------------------
+// Fast mission prediction (quasi-steady segments)
+// ---------------------------------------------------------------------------
+function predictMission(design) {
+  const ac = buildAircraft(design);
+  const d = ac.d;
+  const out = { ac, ok: true, notes: [] };
+  const rho0 = isa(0).rho;
+  // static thrust
+  const eng0 = solveEngine(ac.geo, d.swirl, 0, rho0, ac.PengShaftMax);
+  out.staticThrust = ac.nEng * eng0.T;
+  out.staticEng = eng0;
+  out.tw = out.staticThrust / ac.W;
+  if (ac.m > K.mtowKg) out.notes.push({ level: 'bad', text: `Too heavy: ${Math.round(ac.m)} kg is over the ${K.mtowKg} kg limit for this airframe.` });
+
+  // --- takeoff roll
+  let V = 0, x = 0, t = 0, E = 0, guess = eng0.mdot;
+  const mu = 0.03;
+  const aG = WING.incidence;
+  const CLg = WING.cla * (aG - WING.alpha0.to);
+  let rolled = false;
+  while (t < 240) {
+    const dt = 0.25;
+    const eng = solveEngine(ac.geo, d.swirl, V, rho0, ac.PengShaftMax, guess);
+    guess = eng.mdot;
+    const a = aeroForces(ac, V, rho0, CLg, 'to', true, eng, 0);
+    const N = Math.max(0, ac.W - a.L);
+    const acc = (ac.nEng * eng.T - a.D - mu * N) / ac.m;
+    E += batteryPower(ac, eng) * dt;
+    V = Math.max(0, V + acc * dt); x += V * dt; t += dt;
+    if (V >= ac.vr) { rolled = true; break; }
+    if (acc < 0.05 && t > 5) break;
+    if (x > 4000) break;
+  }
+  out.takeoffRoll = x;
+  out.takeoffTime = t;
+  if (!rolled) {
+    out.ok = false;
+    out.fail = x > 4000 ? 'runway' : 'thrust';
+    out.notes.unshift({ level: 'bad', text: x > 4000 ? 'Can’t take off: it would need more than 4 km of runway.' : 'Can’t take off: the engines can’t push hard enough to reach flying speed.' });
+    out.range = 0;
+    return out;
+  }
+  if (x > 1200) out.notes.push({ level: 'warn', text: `Long takeoff run (${Math.round(x)} m). Small airfields have 600–1,000 m.` });
+  let dist = x; // count distance from brake release
+  let time = t;
+  // short transition / initial climb to 15 m at V2 (approximation)
+  // --- climb in bands
+  const hc = d.cruiseAltM;
+  let h = 0;
+  const climbLog = [];
+  let ceilingHit = false;
+  const band = 100;
+  while (h < hc - 1) {
+    const hm = h + band / 2;
+    const bc = bestClimb(ac, hm);
+    if (bc.roc < 1.0) { ceilingHit = true; break; }
+    const dh = Math.min(band, hc - h);
+    const dt = dh / bc.roc;
+    const P = batteryPower(ac, bc.eng);
+    E += P * dt;
+    time += dt;
+    dist += Math.sqrt(Math.max(0, bc.V * bc.V - bc.roc * bc.roc)) * dt;
+    h += dh;
+    climbLog.push({ h, V: bc.V, roc: bc.roc });
+  }
+  out.climbTime = time - t;
+  out.climbLog = climbLog;
+  out.cruiseAlt = h;
+  out.avgRoc = h > 0 ? h / out.climbTime : 0;
+  if (ceilingHit && h < 150) {
+    out.ok = false;
+    out.fail = 'climb';
+    out.notes.unshift({ level: 'bad', text: 'It lifts off but can barely climb. The engines only just beat the drag.' });
+    out.range = 0;
+    out.climbE = E;
+    return out;
+  }
+  if (ceilingHit) {
+    out.notes.push({ level: 'warn', text: `Can’t climb to ${hc.toLocaleString()} m. It levels off at about ${Math.round(h / 10) * 10} m.` });
+  }
+
+  // --- cruise
+  const vmax = maxLevelSpeed(ac, h);
+  out.vmax = vmax;
+  if (!(vmax > 0)) {
+    out.ok = false;
+    out.fail = 'climb';
+    out.notes.unshift({ level: 'bad', text: 'It can’t hold level flight at any speed.' });
+    out.range = 0;
+    out.climbE = E;
+    return out;
+  }
+  let Vc = d.cruiseKmh / 3.6;
+  if (vmax > 0 && Vc > vmax * 0.995) {
+    out.notes.push({ level: 'warn', text: `Can’t reach ${d.cruiseKmh} km/h. Top speed at this height is ${Math.round(vmax * 3.6)} km/h.` });
+    Vc = vmax * 0.995;
+  }
+  const vsAlt = ac.vsClean * Math.sqrt(rho0 / isa(h).rho);
+  if (Vc < vsAlt * 1.25) Vc = vsAlt * 1.25;
+  const cr = levelFlight(ac, Vc, h);
+  out.cruise = cr;
+  out.cruiseV = Vc;
+  const br = bestRangeSpeed(ac, h, vmax);
+  out.bestRangeV = br.V;
+
+  // --- descent at idle, speed ~ cruise, from h to 300 m, then 3-degree approach
+  const descent = descentPlan(ac, h, Vc);
+  out.descent = descent;
+  const Euse = ac.energyJ * (1 - K.reserve);
+  const Ecruise = Euse - E - descent.E;
+  if (Ecruise <= 0) {
+    out.ok = false;
+    out.fail = 'battery';
+    out.notes.unshift({ level: 'bad', text: 'Battery runs out before the plane can climb and come back down. Add battery or cut weight.' });
+    out.range = 0;
+    out.climbE = E;
+    return out;
+  }
+  const tc = Ecruise / cr.Pbatt;
+  out.cruiseTime = tc;
+  out.cruiseDist = Vc * tc;
+  out.climbE = E;
+  dist += out.cruiseDist + descent.dist;
+  time += tc + descent.time;
+  out.range = dist;
+  out.time = time;
+  out.Edescent = descent.E;
+  out.descentStartE = descent.E * 1.12 + ac.energyJ * K.reserve; // when to start down
+  return out;
+}
+
+function descentPlan(ac, h, Vc) {
+  let E = 0, dist = 0, time = 0;
+  let hh = h;
+  const idle = 0.04;
+  const band = 100;
+  const Vd = Math.min(Vc, 1.9 * ac.vsClean);
+  while (hh > 300) {
+    const hm = hh - band / 2;
+    const { rho } = isa(hm);
+    const q = 0.5 * rho * Vd * Vd;
+    const CL = ac.W / (q * WING.S);
+    const eng = solveEngine(ac.geo, ac.d.swirl, Vd, rho, idle * ac.PengShaftMax);
+    const a = aeroForces(ac, Vd, rho, CL, 'clean', false, eng, 1e9);
+    const sinG = (ac.nEng * eng.T - a.D) / ac.W; // negative
+    const rod = Math.max(1, -sinG * Vd);
+    const dh = Math.min(band, hh - 300);
+    const dt = dh / rod;
+    E += batteryPower(ac, eng) * dt;
+    time += dt;
+    dist += Vd * dt;
+    hh -= dh;
+  }
+  // approach: 3 degree glide path at Vapp, flaps + gear
+  const Va = ac.vApp;
+  const { rho } = isa(150);
+  const q = 0.5 * rho * Va * Va;
+  const CL = ac.W / (q * WING.S);
+  const g3 = 3 * D2R;
+  const a0 = aeroForces(ac, Va, rho, CL, 'land', true, null, 1e9);
+  const Treq = Math.max(0, a0.D - ac.W * Math.sin(g3));
+  const r = throttleFor(ac, Treq, Va, rho);
+  const ta = Math.min(hh, 300) / (Va * Math.sin(g3));
+  E += batteryPower(ac, r.eng) * ta;
+  time += ta;
+  dist += Math.min(hh, 300) / Math.tan(g3);
+  return { E, dist, time, Vd };
+}
+
+export { G, D2R, isa, DEFAULT_DESIGN, RANGES, K, WING, engineGeometry, DH_WARN, solveEngine, massBreakdown, buildAircraft, aeroForces, batteryPower, throttleFor, levelFlight, maxLevelSpeed, bestClimb, bestRangeSpeed, predictMission, descentPlan };
