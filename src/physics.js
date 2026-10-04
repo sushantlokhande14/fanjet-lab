@@ -616,4 +616,235 @@ function descentPlan(ac, h, Vc) {
   return { E, dist, time, Vd };
 }
 
-export { G, D2R, isa, DEFAULT_DESIGN, RANGES, K, WING, engineGeometry, DH_WARN, solveEngine, massBreakdown, buildAircraft, aeroForces, batteryPower, throttleFor, levelFlight, maxLevelSpeed, bestClimb, bestRangeSpeed, predictMission, descentPlan };
+// ---------------------------------------------------------------------------
+// Time-stepped flight for the animation
+// ---------------------------------------------------------------------------
+class FlightSim {
+  constructor(design) {
+    this.pred = predictMission(design);
+    this.ac = this.pred.ac;
+    this.reset();
+  }
+
+  reset() {
+    const ac = this.ac;
+    this.s = {
+      phase: 'ready', t: 0, x: 0, h: 0, V: 0, gamma: 0,
+      alpha: WING.incidence, theta: 0,
+      throttle: 0, throttleCmd: 0,
+      energyJ: ac.energyJ,
+      gear: 1, gearCmd: 1,
+      flaps: 'to', flapPos: 0.5,
+      mdotGuess: 0, eng: null, T: 0, D: 0, L: 0, CL: 0,
+      Pbatt: 0, rocLow: 0, vTarget: ac.d.cruiseKmh / 3.6,
+      hTarget: this.pred.ok ? this.pred.cruiseAlt : ac.d.cruiseAltM,
+      runway2: null, notes: [], log: [], logT: -1e9, events: [], lastPhase: 'ready',
+      tdV: 0, cantReach: false,
+    };
+    this.s.eng = solveEngine(ac.geo, ac.d.swirl, 0, isa(0).rho, 0);
+  }
+
+  start() {
+    if (this.s.phase === 'ready') { this.s.phase = 'roll'; this.s.throttleCmd = 1; }
+  }
+
+  setCruiseSpeed(kmh) { this.s.vTarget = kmh / 3.6; }
+
+  get soc() { return this.s.energyJ / this.ac.energyJ; }
+
+  // vertical-speed / speed controllers -> gamma command
+  step(dt) {
+    const s = this.s, ac = this.ac;
+    if (s.phase === 'ready' || s.phase === 'landed' || s.phase === 'aborted') return;
+    const { rho } = isa(s.h);
+    const V = Math.max(s.V, 0.01);
+    const W = ac.W, m = ac.m;
+    const airborne = !(s.phase === 'roll' || s.phase === 'rollout' || s.phase === 'landed');
+    const cfg = s.flaps;
+    const vsCleanAlt = ac.vsClean * Math.sqrt(isa(0).rho / rho);
+
+    // ---- battery empty: motors stop
+    if (s.energyJ <= 0 && s.phase !== 'glide' && airborne) {
+      s.phase = 'glide';
+      s.notes.push({ t: s.t, text: 'Battery empty: gliding down to a field' });
+    }
+    if (s.energyJ <= 0) s.throttleCmd = 0;
+    // ---- engines (power lags the command like a real motor spooling)
+    s.throttle += (s.throttleCmd - s.throttle) * (1 - Math.exp(-dt / 0.7));
+    const eng = solveEngine(ac.geo, ac.d.swirl, s.V, rho, s.throttle * ac.PengShaftMax, s.mdotGuess);
+    s.mdotGuess = eng.mdot;
+    s.eng = eng;
+    const T = ac.nEng * eng.T;
+
+    // ---- energy
+    s.Pbatt = batteryPower(ac, eng);
+    s.energyJ = Math.max(0, s.energyJ - s.Pbatt * dt);
+
+    if (!airborne) {
+      // ground run
+      const aG = WING.incidence;
+      const CL = WING.cla * (aG - WING.alpha0[cfg]);
+      const a = aeroForces(ac, s.V, rho, CL, cfg, s.gear > 0.5, eng, 0);
+      const Nf = Math.max(0, W - a.L);
+      const mu = s.phase === 'rollout' ? 0.32 : 0.03;
+      let acc = (T - a.D - mu * Nf) / m;
+      if (s.phase === 'rollout' && s.V + acc * dt < 0) acc = -s.V / dt;
+      s.V = Math.max(0, s.V + acc * dt);
+      s.x += s.V * dt;
+      s.alpha = aG; s.gamma = 0; s.CL = CL; s.L = a.L; s.D = a.D; s.T = T;
+      if (s.phase === 'roll') {
+        s.throttleCmd = 1;
+        if (s.V >= ac.vr) { s.phase = 'climb'; s.notes.push({ t: s.t, text: 'Rotate' }); }
+        else if (s.x > 4000 || (s.t > 8 && acc < 0.04)) {
+          s.phase = 'aborted';
+          s.abortReason = s.x > 4000 ? 'Ran out of runway.' : 'Not enough thrust to reach flying speed.';
+        }
+      } else if (s.phase === 'rollout') {
+        s.throttleCmd = 0;
+        if (s.V < 0.5) { s.V = 0; s.phase = 'landed'; }
+      }
+    } else {
+      // ---- guidance
+      let gammaCmd = s.gamma;
+      const dDrag = s.D || 0;
+      const speedHoldGamma = (vt, k = 0.22) => {
+        const aDes = clamp(k * (vt - s.V), -0.7, 0.7);
+        return Math.asin(clamp((T - dDrag - m * aDes) / W, -0.2, 0.26));
+      };
+      const altHoldGamma = (ht) => {
+        const vsCmd = clamp(0.18 * (ht - s.h), -5, 5);
+        return Math.asin(clamp(vsCmd / V, -0.2, 0.2));
+      };
+      const autothrottle = (vt) => {
+        const aDes = clamp(0.2 * (vt - s.V), -0.6, 0.6);
+        const Treq = dDrag + W * Math.sin(s.gamma) + m * aDes;
+        s.atTimer = (s.atTimer || 0) - dt;
+        if (s.atTimer <= 0 || s.throttleCmd === undefined) {
+          s.atTimer = 0.4;
+          const r = throttleFor(ac, Math.max(0, Treq), s.V, rho, s.mdotGuess);
+          s.throttleCmd = r.throttle;
+          s.atSaturated = r.saturated;
+        }
+      };
+
+      switch (s.phase) {
+        case 'climb': {
+          s.throttleCmd = 1;
+          const vt = s.h < 150 ? 1.2 * ac.vsTO : Math.max(1.3 * vsCleanAlt, this.climbSpeed(s.h));
+          gammaCmd = speedHoldGamma(vt);
+          if (s.h < 20) gammaCmd = Math.max(gammaCmd, 0.03);
+          if (s.h > 12) s.gearCmd = 0;
+          if (s.h > 150 && s.V > 1.2 * ac.vsClean) s.flaps = 'clean';
+          // level off
+          const roc = s.V * Math.sin(s.gamma);
+          if (s.h >= s.hTarget - Math.max(30, roc * 8)) { s.phase = 'cruise'; s.throttleCmd = s.throttle; s.atTimer = 0; }
+          if (roc < 1.0 && s.h > 60) { s.rocLow += dt; } else s.rocLow = 0;
+          if (roc < 0.3 && s.h <= 60 && s.t > 40) { s.stuck = (s.stuck || 0) + dt; } else s.stuck = 0;
+          if (s.stuck > 40) {
+            s.phase = 'approach'; s.flaps = 'land'; s.gearCmd = 1;
+            s.aim = s.x + Math.max(s.h, 5) / Math.tan(3 * D2R) + 200; s.runway2 = null; s.fieldLanding = true;
+            s.notes.push({ t: s.t, text: 'Can\u2019t climb: landing straight ahead' });
+            break;
+          }
+          if (s.rocLow > 30) {
+            s.hTarget = s.h; s.phase = 'cruise'; s.atTimer = 0;
+            s.notes.push({ t: s.t, text: `Leveled off at ${Math.round(s.h)} m: can't climb higher` });
+          }
+          break;
+        }
+        case 'cruise': {
+          gammaCmd = altHoldGamma(s.hTarget);
+          autothrottle(Math.max(s.vTarget, 1.25 * vsCleanAlt));
+          s.cantReach = !!s.atSaturated && s.V < s.vTarget - 2;
+          const startDown = this.pred.descentStartE ?? ac.energyJ * (K.reserve + 0.04);
+          if (s.energyJ <= startDown) {
+            s.phase = 'descent'; s.throttleCmd = 0.04;
+            s.notes.push({ t: s.t, text: 'Battery at descent point: heading down' });
+          }
+          break;
+        }
+        case 'descent': {
+          s.throttleCmd = 0.04;
+          const vd = this.pred.descent ? this.pred.descent.Vd : 1.8 * ac.vsClean;
+          gammaCmd = Math.max(speedHoldGamma(vd), -0.12);
+          if (s.h <= 300) {
+            s.phase = 'approach';
+            s.flaps = 'land'; s.gearCmd = 1;
+            const g3 = 3 * D2R;
+            s.runway2 = s.x + s.h / Math.tan(g3) - 300; // threshold; aim 300 m in
+            s.aim = s.runway2 + 300;
+          }
+          break;
+        }
+        case 'approach': {
+          const g3 = 3 * D2R;
+          const hgp = Math.max(0, (s.aim - s.x) * Math.tan(g3));
+          const vsCmd = -s.V * Math.sin(g3) + 0.2 * (hgp - s.h);
+          gammaCmd = Math.asin(clamp(vsCmd / V, -0.12, 0.05));
+          autothrottle(ac.vApp);
+          if (s.h < 9) { s.phase = 'flare'; s.throttleCmd = 0; }
+          break;
+        }
+        case 'flare': {
+          s.throttleCmd = 0;
+          gammaCmd = -0.012;
+          break;
+        }
+        case 'glide': {
+          s.throttleCmd = 0;
+          s.gearCmd = s.h < 200 ? 1 : 0;
+          if (s.h < 150) s.flaps = 'land';
+          gammaCmd = Math.max(speedHoldGamma(1.35 * vsCleanAlt), -0.2);
+          if (s.h < 9) { s.phase = 'flare'; s.fieldLanding = true; }
+          break;
+        }
+      }
+      // ---- flight path dynamics
+      const tau = s.phase === 'flare' ? 1.0 : 1.8;
+      const dGamma = (gammaCmd - s.gamma) * (1 - Math.exp(-dt / tau));
+      let gammaDot = dGamma / dt;
+      const q = 0.5 * rho * V * V;
+      let Lreq = W * Math.cos(s.gamma) + m * V * gammaDot;
+      let CL = Lreq / (q * WING.S);
+      const clCap = WING.clmax[cfg] * 0.95;
+      if (CL > clCap) { CL = clCap; gammaDot = (CL * q * WING.S - W * Math.cos(s.gamma)) / (m * V); }
+      if (CL < -0.3) { CL = -0.3; gammaDot = (CL * q * WING.S - W * Math.cos(s.gamma)) / (m * V); }
+      const a = aeroForces(ac, s.V, rho, CL, cfg, s.gear > 0.5, eng, s.h);
+      s.alpha = WING.alpha0[cfg] + CL / WING.cla;
+      s.CL = CL; s.L = a.L; s.D = a.D; s.T = T;
+      const acc = (T - a.D - W * Math.sin(s.gamma)) / m;
+      s.V = Math.max(1, s.V + acc * dt);
+      s.gamma += gammaDot * dt;
+      s.x += s.V * Math.cos(s.gamma) * dt;
+      s.h += s.V * Math.sin(s.gamma) * dt;
+      if (s.h <= 0) {
+        if (s.phase === 'climb') { s.h = 0; s.gamma = Math.max(0, s.gamma); }
+        else { s.h = 0; s.gamma = 0; s.phase = 'rollout'; s.tdV = s.V; s.throttleCmd = 0; }
+      }
+    }
+    if (s.phase !== s.lastPhase) { s.events.push({ t: s.t, phase: s.phase }); s.lastPhase = s.phase; }
+    // gear animation
+    s.gear += clamp(s.gearCmd - s.gear, -dt / 6, dt / 6);
+    s.flapPos += clamp((cfgFlap(s.flaps)) - s.flapPos, -dt / 5, dt / 5);
+    s.theta = s.gamma + s.alpha - WING.incidence;
+    s.t += dt;
+    if (s.t - s.logT >= 4 || s.phase === 'landed') {
+      s.logT = s.t;
+      s.log.push({ t: s.t, x: s.x, h: s.h, V: s.V, soc: this.soc, P: s.Pbatt });
+    }
+  }
+
+  climbSpeed(h) {
+    if (!this._climbTable) {
+      this._climbTable = [];
+      for (let hh = 0; hh <= 6500; hh += 500) this._climbTable.push(bestClimb(this.ac, hh).V);
+    }
+    const i = clamp(h / 500, 0, this._climbTable.length - 1.001);
+    const i0 = Math.floor(i), f = i - i0;
+    return this._climbTable[i0] * (1 - f) + this._climbTable[i0 + 1] * f;
+  }
+}
+
+function cfgFlap(c) { return c === 'clean' ? 0 : c === 'to' ? 0.45 : 1; }
+
+export { G, D2R, isa, DEFAULT_DESIGN, RANGES, K, WING, engineGeometry, DH_WARN, solveEngine, massBreakdown, buildAircraft, aeroForces, batteryPower, throttleFor, levelFlight, maxLevelSpeed, bestClimb, bestRangeSpeed, predictMission, descentPlan, FlightSim };
