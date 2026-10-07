@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Electric Fan-Jet Lab</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=B612:ital,wght@0,400;0,700&family=B612+Mono&family=Barlow+Condensed:wght@500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="src/styles.css">
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div class="app" id="app">
+  <header class="top">
+    <div class="brand">
+      <svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+        <path d="M4 13 L4 27 Q4 30 7 30 L27 29 L36 24 L36 16 L27 11 L7 10 Q4 10 4 13 Z"/>
+        <path d="M11 13 L11 27 M15 14 L15 26 M19 14.5 L19 25.5" stroke-linecap="round"/>
+        <path d="M27 14 L27 26" stroke-dasharray="2 2"/>
+      </svg>
+      <div>
+        <h1>Electric Fan-Jet Lab</h1>
+        <p>A battery plane on six multi-stage ducted fans</p>
+      </div>
+    </div>
+    <nav class="modes" role="tablist" aria-label="Mode">
+      <button id="tab-design" role="tab" aria-selected="true">Design</button>
+      <button id="tab-fly" role="tab" aria-selected="false">Fly</button>
+    </nav>
+  </header>
+
+  <main class="stage">
+    <section class="viewport" id="viewport" aria-label="3D view of the plane">
+      <canvas id="gl"></canvas>
+      <div class="ov ov-tl">
+        <div class="glass cond" id="cond">
+          <div class="vseg" role="group" aria-label="Flight condition">
+            <button id="cond-cruise" data-cond="cruise" aria-pressed="true">Cruise</button>
+            <button id="cond-takeoff" data-cond="takeoff" aria-pressed="false">Full power, standing still</button>
+          </div>
+          <div class="cap" id="cond-cap">Cruising.</div>
+        </div>
+        <div class="glass hud" id="hud" hidden>
+          <div class="phase" id="hud-phase">Ready</div>
+          <div class="cell"><span class="k">Speed</span><span class="v" id="hud-spd">0<small>km/h</small></span></div>
+          <div class="cell"><span class="k">Height</span><span class="v" id="hud-alt">0<small>m</small></span></div>
+          <div class="cell"><span class="k">Battery</span><span class="v" id="hud-bat">100<small>%</small></span></div>
+          <div class="cell"><span class="k">Distance</span><span class="v" id="hud-dist">0<small>km</small></span></div>
+        </div>
+      </div>
+      <div class="ov ov-tr">
+        <div class="glass vseg" id="views" role="group" aria-label="Camera"></div>
+      </div>
+      <div class="ov ov-bl">
+        <div class="glass legend" id="legend">
+          <div class="t">Air speed <span id="lg-ref"></span></div>
+          <div class="bar"></div>
+          <div class="ticks"><span>slower</span><span>flight speed</span><span>faster</span></div>
+        </div>
+      </div>
+      <div class="ov ov-br" id="warpwrap" hidden>
+        <div class="glass warpbar">
+          <span>Time</span>
+          <div class="vseg" id="warp" role="group" aria-label="Time speed">
+            <button id="warp-auto" data-warp="auto" aria-pressed="true">Auto</button>
+            <button id="warp-1" data-warp="1" aria-pressed="false">1&times;</button>
+            <button id="warp-10" data-warp="10" aria-pressed="false">10&times;</button>
+            <button id="warp-60" data-warp="60" aria-pressed="false">60&times;</button>
+          </div>
+        </div>
+      </div>
+      <div class="card" id="card" hidden><div class="glass inner" id="card-inner"></div></div>
+      <div class="ov nogl" id="nogl" hidden>
+        <p>The 3D view couldn&rsquo;t start here (WebGL is off, or the 3D library didn&rsquo;t load). The numbers, the engine diagram and the flight still work.</p>
+      </div>
+    </section>
+
+    <section class="engine-panel" aria-label="Inside one engine">
+      <div class="ep-head">
+        <h2>Inside one engine</h2>
+        <div class="sum" id="ep-sum"></div>
+      </div>
+      <div class="ep-body">
+        <div class="svgwrap"><svg id="engine-svg" viewBox="0 0 760 236" role="img" aria-label="Engine cross-section with the air speed through it"></svg></div>
+        <div class="fans" id="fans"></div>
+      </div>
+      <div class="energy">
+        <div class="t"><span id="en-title">Where the battery&rsquo;s power goes</span><b id="en-eff"></b></div>
+        <div class="ebar" id="ebar"></div>
+        <div class="ekey" id="ekey"></div>
+      </div>
+    </section>
+
+    <aside class="side" id="side">
+      <div id="design-panel">
+        <section aria-labelledby="h-result">
+          <h2 id="h-result">Result <small id="res-sub">for this design</small></h2>
+          <div class="result-top">
+            <div class="bignum">
+              <span class="k">Range</span>
+              <span class="v" id="r-range">&ndash;<small>km</small></span>
+              <span class="d" id="r-time"></span>
+            </div>
+            <span class="delta" id="r-delta" hidden></span>
+          </div>
+          <dl class="kv">
+            <div><dt>Takeoff run</dt><dd id="r-to">&ndash;</dd></div>
+            <div><dt>Push at takeoff</dt><dd id="r-thrust">&ndash;</dd></div>
+            <div><dt>Battery draw, cruise</dt><dd id="r-pow">&ndash;</dd></div>
+            <div><dt>Overall efficiency</dt><dd id="r-eff">&ndash;</dd></div>
+            <div><dt>Top speed</dt><dd id="r-vmax">&ndash;</dd></div>
+            <div><dt>Best speed for range</dt><dd id="r-vbest">&ndash;</dd></div>
+            <div><dt>Weight</dt><dd id="r-mass">&ndash;</dd></div>
+            <div><dt>Battery energy</dt><dd id="r-energy">&ndash;</dd></div>
+          </dl>
+          <ul class="notes" id="notes"></ul>
+          <div class="tries" id="tries"></div>
+          <div class="btn-row">
+            <button class="btn primary" id="go-fly">Fly this design</button>
+            <button class="btn" id="reset-design">Back to the original idea</button>
+          </div>
+        </section>
+
+        <section aria-labelledby="h-eng">
+          <h2 id="h-eng">Engines <small>same on every pod</small></h2>
+          <div class="ctl">
+            <div class="ctl-head"><label for="fanD">Intake fan size</label><output id="fanD-out" for="fanD"></output></div>
+            <input type="range" id="fanD">
+            <p class="hint">The big first fan. Bigger moves more air but adds weight and drag.</p>
+          </div>
+          <div class="ctl">
+            <div class="ctl-head"><label for="stages">Fans in a row</label><output id="stages-out" for="stages"></output></div>
+            <input type="range" id="stages">
+            <p class="hint">Each fan has its own motor and gets an equal share of the power.</p>
+          </div>
+          <div class="ctl">
+            <div class="ctl-head"><label for="nozzleRatio">Nozzle size</label><output id="nozzleRatio-out" for="nozzleRatio"></output></div>
+            <input type="range" id="nozzleRatio">
+            <p class="hint">Exit width as a share of the intake fan. Smaller makes a faster jet.</p>
+          </div>
+          <div class="ctl">
+            <span class="lab" id="swirl-lab">Between the fans</span>
+            <div class="seg" id="swirl" role="group" aria-labelledby="swirl-lab">
+              <button id="swirl-none" data-v="none" aria-pressed="false">Nothing</button>
+              <button id="swirl-stators" data-v="stators" aria-pressed="true">Stators</button>
+              <button id="swirl-contra" data-v="contra" aria-pressed="false">Counter-spin</button>
+            </div>
+            <p class="hint" id="swirl-hint"></p>
+          </div>
+          <div class="ctl">
+            <div class="ctl-head"><label for="enginesPerWing">Engines per wing</label><output id="enginesPerWing-out" for="enginesPerWing"></output></div>
+            <input type="range" id="enginesPerWing">
+          </div>
+          <div class="ctl">
+            <div class="ctl-head"><label for="powerKW">Motor power, all engines</label><output id="powerKW-out" for="powerKW"></output></div>
+            <input type="range" id="powerKW">
+          </div>
+        </section>
+
+        <section aria-labelledby="h-plane">
+          <h2 id="h-plane">Plane</h2>
+          <div class="ctl">
+            <div class="ctl-head"><label for="people">People on board</label><output id="people-out" for="people"></output></div>
+            <input type="range" id="people">
+          </div>
+          <div class="ctl">
+            <div class="ctl-head"><label for="batteryKg">Battery weight</label><output id="batteryKg-out" for="batteryKg"></output></div>
+            <input type="range" id="batteryKg">
+          </div>
+          <div class="ctl">
+            <div class="ctl-head"><label for="whPerKg">Battery quality</label><output id="whPerKg-out" for="whPerKg"></output></div>
+            <input type="range" id="whPerKg">
+            <p class="hint">Energy per kg of pack. Today&rsquo;s best aviation packs are about 250 Wh/kg.</p>
+          </div>
+        </section>
+
+        <section aria-labelledby="h-trip">
+          <h2 id="h-trip">Trip</h2>
+          <div class="ctl">
+            <div class="ctl-head"><label for="cruiseAltM">Cruise height</label><output id="cruiseAltM-out" for="cruiseAltM"></output></div>
+            <input type="range" id="cruiseAltM">
+          </div>
+          <div class="ctl">
+            <div class="ctl-head"><label for="cruiseKmh">Cruise speed</label><output id="cruiseKmh-out" for="cruiseKmh"></output></div>
+            <input type="range" id="cruiseKmh">
+            <p class="hint" id="cruise-hint"></p>
+          </div>
+        </section>
+      </div>
+
+      <div id="fly-panel" hidden>
+        <section aria-labelledby="h-flight">
+          <h2 id="h-flight">Flight <small id="fl-phase">Ready</small></h2>
+          <div class="flyr">
+            <div><span class="k">Distance</span><span class="v" id="fl-dist">0<small>km</small></span></div>
+            <div><span class="k">Time in the air</span><span class="v" id="fl-time">0:00</span></div>
+            <div><span class="k">Battery draw</span><span class="v" id="fl-pow">0<small>kW</small></span></div>
+            <div><span class="k">Total push</span><span class="v" id="fl-thrust">0<small>kN</small></span></div>
+          </div>
+          <div>
+            <div class="ctl-head"><span class="lab">Battery</span><output id="fl-bat">100%</output></div>
+            <div class="batt"><span id="fl-batbar" style="width:100%"></span></div>
+          </div>
+          <svg id="trip-svg" viewBox="0 0 340 150" role="img" aria-label="Height and battery along the trip"></svg>
+        </section>
+        <section aria-labelledby="h-fctl">
+          <h2 id="h-fctl">Controls</h2>
+          <div class="ctl">
+            <div class="ctl-head"><label for="fl-cruise">Cruise speed</label><output id="fl-cruise-out" for="fl-cruise"></output></div>
+            <input type="range" id="fl-cruise">
+            <p class="hint">Change it mid-flight and watch the battery draw move.</p>
+          </div>
+          <div class="btn-row">
+            <button class="btn primary" id="fl-restart">Restart flight</button>
+            <button class="btn" id="fl-design">Change the design</button>
+          </div>
+        </section>
+        <section aria-labelledby="h-log">
+          <h2 id="h-log">Flight log</h2>
+          <ol class="log" id="fl-log"></ol>
+        </section>
+      </div>
+
+      <div class="foot">
+        <p>Fans: mean-line Euler model, each fan gets an equal share of power, stall flagged when the blades slow the air too sharply. Wing: lift and drag polar. Air streaks: potential flow round the wing, tip vortices, intake and jet models.</p>
+        <p>First-order estimates for exploring the idea, not engineering numbers. Weights and battery figures are typical 2026 values.</p>
+      </div>
+    </aside>
+  </main>
+</div>
+<script type="module" src="src/app.js"></script>
+</body>
+</html>

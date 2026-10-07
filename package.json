@@ -8,6 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
+    "start": "node tools/serve.mjs",
     "test": "node --test"
   },
   "license": "MIT"
