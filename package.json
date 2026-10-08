@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node tools/serve.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "build": "node tools/bundle.mjs"
   },
   "license": "MIT"
 }
